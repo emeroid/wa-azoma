@@ -36,7 +36,7 @@ let cleanupLoop; // To hold the interval reference
 const sendWebhook = (endpoint, data) => {
     axios.post(`${WEBHOOK_BASE_URL}${endpoint}`, data)
         .catch(err => {
-            console.error(`[WEBHOOK_ERROR] Failed to send webhook to ${endpoint} for session ${data.sessionId || 'N/A'}:`, err);
+            console.error(`[WEBHOOK_ERROR] Failed to send webhook to ${WEBHOOK_BASE_URL}${endpoint} for session ${data.sessionId || 'N/A'}:`, err);
         });
 };
 
@@ -416,6 +416,7 @@ app.post('/sessions/logout', async (req, res) => {
 app.listen(PORT, () => {
     console.log(`\n======================================================`);
     console.log(`WhatsApp Gateway running on port ${PORT}`);
+    console.log(`Webhook Base URL: ${WEBHOOK_BASE_URL}`); // Display the resolved URL
     console.log('Mode: LAZY-LOADED & ON-DEMAND (Low Memory at Startup)');
     console.log(`Inactivity Timeout: ${INACTIVITY_TIMEOUT_MS / 60000} minutes`);
     console.log(`======================================================\n`);
