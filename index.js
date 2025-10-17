@@ -11,7 +11,7 @@ app.use(express.json());
 
 // --- Configuration ---
 const PORT = 3000;
-const WEBHOOK_BASE_URL = 'http://localhost:8000/webhook'; 
+const WEBHOOK_BASE_URL = process.env.WEBHOOK_BASE_URL || 'http://localhost:8000/webhook'; 
 const SESSION_DIR = path.join(__dirname, '.wwebjs_auth');
 
 // --- Enterprise Scaling Configuration ---
@@ -36,7 +36,7 @@ let cleanupLoop; // To hold the interval reference
 const sendWebhook = (endpoint, data) => {
     axios.post(`${WEBHOOK_BASE_URL}${endpoint}`, data)
         .catch(err => {
-            console.error(`[WEBHOOK_ERROR] Failed to send webhook to ${endpoint} for session ${data.sessionId || 'N/A'}:`, err.message);
+            console.error(`[WEBHOOK_ERROR] Failed to send webhook to ${endpoint} for session ${data.sessionId || 'N/A'}:`, err);
         });
 };
 
@@ -113,7 +113,8 @@ const setupClientEvents = (client, sessionId) => {
     client.on('qr', (qr) => {
         console.log(`[QR] QR code received for ${sessionId}`);
         qrcode.toDataURL(qr, (err, url) => {
-            if (err) return console.error(`[QR_ERROR] Failed to generate QR for ${sessionId}:`, err);
+
+            if (err) return console.error(`[QR_ERROR] Failed to generate QR for ${sessionId}:`, err.message);
             sendWebhook('/qr-code-received', { sessionId, qrCodeUrl: url });
         });
     });
@@ -153,12 +154,6 @@ const setupClientEvents = (client, sessionId) => {
             return;
         }
 
-        // whatsapp-web.js ack values:
-        // 1: Sent (server received it)
-        // 2: Delivered (recipient phone received it)
-        // 3: Read (recipient read it)
-        // -1: Failure (e.g., recipient blocked, message expired)
-        
         let status;
         
         switch (ack) {
