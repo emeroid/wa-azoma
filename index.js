@@ -6,6 +6,9 @@ const fs = require('fs/promises');
 const path = require('path');
 const dayjs = require('dayjs');
 
+// To read the environment variables (WEBHOOK_BASE_URL)
+require('dotenv').config();
+
 const app = express();
 app.use(express.json());
 
