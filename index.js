@@ -184,9 +184,9 @@ const setupClientEvents = (client, sessionId) => {
         sendWebhook('/connected', { sessionId, phone: client.info.wid.user });
     });
 
-    client.on('message_create', (msg) => {
+    client.on('message', (msg) => {
         // Only process incoming messages
-        if (msg.fromMe || !msg.id.remote) {
+        if (msg.fromMe || msg.from === 'status@broadcast' || !msg.id.remote) {
             return;
         }
 
