@@ -265,15 +265,73 @@ const startCleanupLoop = () => {
     }, CLEANUP_INTERVAL_MS);
 };
 
+
+/**
+ * Classifies a whatsapp-web.js error into a user-friendly code and message.
+ * @param {Error} err The error object.
+ * @returns {{code: string, friendly: string, raw: string}}
+ */
+const classifyError = (err) => {
+    const rawMessage = err.message || 'Unknown error.';
+    
+    // 404 = Number not on WhatsApp
+    if (rawMessage.includes('status 404')) {
+        return {
+            code: 'not_on_whatsapp',
+            friendly: 'This phone number is not registered on WhatsApp.',
+            raw: rawMessage
+        };
+    }
+    // 400 = Invalid number format (often)
+    if (rawMessage.includes('status 400') || rawMessage.includes('invalid wid')) {
+        return {
+            code: 'invalid_number_format',
+            friendly: 'The phone number format is incorrect. Please check the number.',
+            raw: rawMessage
+        };
+    }
+    // Timeout
+    if (rawMessage.includes('TimeoutError') || rawMessage.includes('Navigation timeout')) {
+        return {
+            code: 'timeout',
+            friendly: 'The connection to WhatsApp timed out. This may be a network issue. The system will retry.',
+            raw: rawMessage
+        };
+    }
+    // EPIPE / Connection lost
+    if (rawMessage.includes('EPIPE') || rawMessage.includes('Connection closed')) {
+        return {
+            code: 'connection_lost',
+            friendly: 'The connection to the device was temporarily lost. Please wait a moment and try again.',
+            raw: rawMessage
+        };
+    }
+    // Media download failed
+    if (rawMessage.includes('failed to download') || rawMessage.includes('Could not find a valid URL')) {
+        return {
+            code: 'media_failed',
+            friendly: 'The system could not download the media file. Please check the file URL.',
+            raw: rawMessage
+        };
+    }
+
+    // Default
+    return {
+        code: 'unknown',
+        friendly: 'An unknown error occurred. See logs for details.',
+        raw: rawMessage
+    };
+};
+
 const listenForMessages = async () => {
     const subscriber = redisClient.duplicate();
     await subscriber.connect();
     const channelName = process.env.LARAVEL_CHANNEL;
-    console.log('[REDIS] Subscriber connected, listening to "whatsapp:send_queue"');
+    console.log(`[REDIS] Subscriber connected, listening to "${channelName}"`);
 
     await subscriber.subscribe(channelName, async (message) => {
 
-        let sessionId, tempMessageId;
+        let sessionId, tempMessageId, job;
 
         try {
             const job = JSON.parse(message);
@@ -283,8 +341,6 @@ const listenForMessages = async () => {
             ({ sessionId, tempMessageId } = job); 
             
             const { to, message: text, mediaUrl } = job; // Other variables can remain scoped
-
-            // const { sessionId, to, message: text, tempMessageId, mediaUrl } = job;
 
             const clientEntry = activeClients[sessionId];
 
@@ -297,7 +353,7 @@ const listenForMessages = async () => {
 
                 // **THIS IS THE FINAL LOGIC FOR MEDIA + CAPTIONS**
                 if (mediaUrl) {
-                    await new Promise(resolve => setTimeout(resolve, 2000));
+                    // await new Promise(resolve => setTimeout(resolve, 2000));
                     const media = await MessageMedia.fromUrl(mediaUrl, { unsafeMime: true });
                     result = await client.sendMessage(chatId, media, { caption: text });
                 } else {
@@ -315,12 +371,23 @@ const listenForMessages = async () => {
         } catch (err) {
             console.error(`[QUEUE_ERROR] Failed to process job:`, err);
             console.error(`[QUEUE_ERROR] Original Job Payload:`, message);
+            // **NEW ROBUST ERROR HANDLING**
+            if (job && job.tempMessageId) {
+                // We have job info, so classify the error
+                const errorDetails = classifyError(err);
+                
+                sendWebhook('/message-failed', {
+                    tempMessageId: job.tempMessageId,
+                    sessionId: job.sessionId,
+                    reason: errorDetails.raw, // The original error message
+                    errorCode: errorDetails.code, // The new clean code
+                    friendlyError: errorDetails.friendly // The new UI-friendly message
+                });
 
-            sendWebhook('/message-failed', { // **NEW WEBHOOK**
-                tempMessageId,
-                sessionId,
-                reason: err.message // Send the actual error message
-            });
+            } else {
+                // The error was likely in JSON.parse(message)
+                console.error(`[QUEUE_FATAL] Could not parse job, no error reported to Laravel:`, message);
+            }
         }
     });
 };
