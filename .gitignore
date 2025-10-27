@@ -7,3 +7,4 @@
 .env.test
 .env.stage
 .env.dev
+/baileys_sessions

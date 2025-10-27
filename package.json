@@ -11,11 +11,13 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@whiskeysockets/baileys": "^7.0.0-rc.6",
     "axios": "^1.12.2",
     "dayjs": "^1.11.18",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
     "nodemon": "^3.1.10",
+    "pino": "^10.1.0",
     "qrcode": "^1.5.4",
     "redis": "^5.8.3",
     "uuid": "^13.0.0",

@@ -1,14 +1,20 @@
 const express = require('express');
-const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+const { 
+    default: makeWASocket, 
+    useMultiFileAuthState, 
+    DisconnectReason,
+    fetchLatestBaileysVersion,
+    jidNormalizedUser,
+} = require('@whiskeysockets/baileys');
+const pino = require('pino');
 const qrcode = require('qrcode');
 const axios = require('axios');
 const fs = require('fs/promises');
 const path = require('path');
 const dayjs = require('dayjs');
-const { createClient } = require('redis');
 const { v4: uuidv4 } = require('uuid');
+const { createRedisClient, sendWebhook } = require('./shared');
 
-// To read the environment variables
 require('dotenv').config();
 
 const app = express();
@@ -16,222 +22,205 @@ app.use(express.json());
 
 // --- Configuration ---
 const PORT = process.env.PORT || 3000;
-const WEBHOOK_BASE_URL = process.env.WEBHOOK_BASE_URL || 'http://localhost:8000/webhook';
 const API_KEY = process.env.API_KEY;
-const SESSION_DIR = path.join(__dirname, '.wwebjs_auth');
-const WORKER_ID = `whatsapp-worker-${uuidv4()}`; // A unique ID for this process instance
+const SESSIONS_DIR = path.join(__dirname, 'baileys_sessions'); 
+const WORKER_ID = `whatsapp-web-${uuidv4()}`;
 
-// --- Enterprise Scaling Configuration ---
+// --- Scaling Config ---
 const INACTIVITY_TIMEOUT_MS = 30 * 60 * 1000;
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
-const QR_GENERATION_TIMEOUT_MS = 60 * 1000; // 60-second timeout
+// **FIXED: 5 minutes is too long for a QR timeout. Set to 60 seconds.**
+const QR_GENERATION_TIMEOUT_MS = 60 * 1000; 
 
-// --- Redis Client Setup ---
-const redisClient = createClient({
-    // Build the URL from your .env variables
-    // redis[s]://[username:password@]host[:port][/database]
-    url: `redis://${process.env.REDIS_HOST || '127.0.0.1'}:${process.env.REDIS_PORT || 6379}`,
-    // The node-redis client handles 'null' passwords correctly,
-    // but it's cleaner to only add the property if it exists.
-    ...(process.env.REDIS_PASSWORD && process.env.REDIS_PASSWORD !== 'null' && { 
-        password: process.env.REDIS_PASSWORD 
-    })
-});
-
-redisClient.on('error', err => console.error('[REDIS_ERROR]', err));
-
-// --- In-Memory Storage (for this worker only) ---
+// ... (Redis Client, In-Memory Storage, Middleware are all correct) ...
+const redisClient = createRedisClient();
 const activeClients = {};
 const initializingSessions = {};
 let cleanupLoop;
-
-// --- Middleware for Security ---
 const apiKeyMiddleware = (req, res, next) => {
     const providedKey = req.headers['x-api-key'];
-    if (!API_KEY || providedKey === API_KEY) {
-        return next();
-    }
+    if (!API_KEY || providedKey === API_KEY) return next();
     res.status(401).json({ error: 'Unauthorized' });
 };
 app.use(apiKeyMiddleware);
 
-// --- Helper Functions ---
-const sendWebhook = async (endpoint, data, retries = 3) => {
-    for (let i = 0; i < retries; i++) {
-        try {
-            await axios.post(`${WEBHOOK_BASE_URL}${endpoint}`, data, {
-                headers: { 'X-API-KEY': API_KEY }
-            });
-            return;
-        } catch (err) {
-            console.error(`[WEBHOOK_ERROR] Attempt ${i + 1} failed for ${endpoint}:`, err.message);
-            if (i === retries - 1) {
-                console.error(`[WEBHOOK_FATAL] All retries failed for ${endpoint}. Data:`, data);
-            } else {
-                await new Promise(res => setTimeout(res, 1000 * (i + 1)));
-            }
-        }
-    }
-};
+// --- Baileys Helper Functions ---
 
 const cleanupClient = async (sessionId) => {
     const clientEntry = activeClients[sessionId];
     const initEntry = initializingSessions[sessionId];
-
     console.log(`[CLEANUP] Cleaning up session: ${sessionId}`);
 
     if (clientEntry) {
         try {
-            await clientEntry.client.destroy();
+            clientEntry.sock.end(new Error('Inactive cleanup')); 
         } catch (e) {
-            console.error(`[CLEANUP_ERROR] Failed to destroy active client ${sessionId}:`, e.message);
+            console.error(`[CLEANUP_ERROR] Failed to end Baileys socket ${sessionId}:`, e.message);
         }
     }
-    
     if (initEntry) {
         clearTimeout(initEntry.timeoutId);
-        if (initEntry.client) {
-            try {
-                await initEntry.client.destroy();
-            } catch (e) {
-                console.error(`[CLEANUP_ERROR] Failed to destroy initializing client ${sessionId}:`, e.message);
-            }
-        }
     }
 
     delete activeClients[sessionId];
     delete initializingSessions[sessionId];
 
-    // **Ensure Redis is also cleaned up**
     try {
         await redisClient.hDel('active_sessions', sessionId);
-        console.log(`[REDIS] Confirmed deregistration of session ${sessionId} during cleanup.`);
+        console.log(`[REDIS] Confirmed deregistration of session ${sessionId}.`);
     } catch (e) {
-        console.error(`[REDIS_ERROR] Failed to deregister session ${sessionId} during cleanup:`, e.message);
+        console.error(`[REDIS_ERROR] Failed to deregister session ${sessionId}:`, e.message);
     }
 };
 
-const getAvailableSessions = async () => {
-    try {
-        await fs.mkdir(SESSION_DIR, { recursive: true });
-        const entries = await fs.readdir(SESSION_DIR, { withFileTypes: true });
-        return entries.filter(dirent => dirent.isDirectory()).map(dirent => dirent.name);
-    } catch (error) {
-        if (error.code !== 'ENOENT') {
-            console.error("[SCAN_ERROR] Failed to read session directory:", error);
-        }
-        return [];
-    }
-};
+const createSessionClient = async (sessionId) => {
+    console.log(`[SETUP] Creating Baileys client for session: ${sessionId}`);
+    
+    const sessionDir = path.join(SESSIONS_DIR, sessionId);
+    await fs.mkdir(sessionDir, { recursive: true });
 
-const createSessionClient = (sessionId) => {
-    console.log(`[SETUP] Creating client for session: ${sessionId}`);
-    return new Client({
-        authStrategy: new LocalAuth({ clientId: sessionId }),
-        puppeteer: {
-            headless: true,
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process'],
-        }
+    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+    const { version } = await fetchLatestBaileysVersion();
+    
+    const sock = makeWASocket({
+        version,
+        auth: state,
+        printQRInTerminal: false,
+        logger: pino({ level: 'silent' }),
+        browser: ['MyWebApp', 'Chrome', '1.0.0'],
     });
-};
 
-/**
- * --- MODIFIED: LAZY LOADING SESSION GETTER ---
- * Gets an existing active session. Does NOT create a new one.
- * This is used for sending messages where a session MUST be active.
- * @param {string} sessionId
- * @returns {Client|null}
- */
-const getActiveClient = (sessionId) => {
-    const entry = activeClients[sessionId];
-    if (entry && entry.client.info) {
-        entry.lastUsed = new Date();
-        return entry.client;
-    }
-    return null;
-};
+    // --- Setup Event Handlers ---
 
-const setupClientEvents = (client, sessionId) => {
-    client.on('qr', (qr) => {
-        console.log(`[QR] QR code received for ${sessionId}`);
-        if (initializingSessions[sessionId]) {
-            initializingSessions[sessionId].qr = qr;
+    // **IMPROVED: Connection Update Logic**
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr } = update;
+        const sessionDir = path.join(SESSIONS_DIR, sessionId);
+
+        if (qr) {
+            console.log(`[QR] QR code received for ${sessionId}`);
             qrcode.toDataURL(qr, (err, url) => {
                 if (err) return;
+                if (initializingSessions[sessionId]) {
+                    initializingSessions[sessionId].qr = qr;
+                }
                 sendWebhook('/qr-code-received', { sessionId, qrCodeUrl: url });
             });
         }
+
+        if (connection === 'open') {
+            console.log(`[READY] Client is ready for session: ${sessionId}`);
+            if (initializingSessions[sessionId]) {
+                clearTimeout(initializingSessions[sessionId].timeoutId);
+            }
+            activeClients[sessionId] = { sock, lastUsed: new Date() };
+            delete initializingSessions[sessionId];
+
+            try {
+                await redisClient.hSet('active_sessions', sessionId, WORKER_ID);
+                console.log(`[REDIS] Registered session ${sessionId} to WEB worker ${WORKER_ID}`);
+            } catch (e) {
+                console.error(`[REDIS_ERROR] Failed to register session ${sessionId}:`, e.message);
+            }
+            
+            const phone = jidNormalizedUser(sock.user.id).split(':')[0].split('@')[0];
+            sendWebhook('/connected', { sessionId, phone });
+        }
+
+        if (connection === 'close') {
+            const statusCode = (lastDisconnect.error)?.output?.statusCode;
+            
+            // Remove from active list, as it's no longer active
+            delete activeClients[sessionId];
+
+            // Check if this was a fatal error
+            if (statusCode === DisconnectReason.loggedOut) {
+                console.log(`[AUTH_FAILURE] Device logged out: ${sessionId}. Cleaning up.`);
+                sendWebhook('/disconnected', { sessionId, reason: 'logged_out' });
+                
+                // Clear from init list if it was there
+                if(initializingSessions[sessionId]) {
+                    clearTimeout(initializingSessions[sessionId].timeoutId);
+                    delete initializingSessions[sessionId];
+                }
+                
+                // Delete session files
+                await fs.rm(sessionDir, { recursive: true, force: true });
+
+            } else {
+                // **THIS IS THE FIX**
+                // Check if we are *supposed* to be running (i.e., we are still in the init map)
+                // or if we were just cleaned up (in which case init map is empty)
+                if (initializingSessions[sessionId]) {
+                    console.log(`[RECONNECT] Connection closed (e.g., QR timeout). Retrying: ${sessionId}`);
+                    
+                    // We must restart the *entire* process, including the timeout
+                    clearTimeout(initializingSessions[sessionId].timeoutId);
+                    
+                    const newTimeoutId = setTimeout(() => {
+                        console.log(`[TIMEOUT] QR scan (retry) timeout for session: ${sessionId}`);
+                        cleanupClient(sessionId); // This will kill the retry
+                        sendWebhook('/qr-timeout', { sessionId });
+                    }, QR_GENERATION_TIMEOUT_MS);
+                    
+                    initializingSessions[sessionId] = { qr: null, timeoutId: newTimeoutId };
+                    
+                    // Start the client again
+                    createSessionClient(sessionId).catch(err => {
+                        console.error(`[INIT_ERROR] (Retry) Failed to initialize ${sessionId}:`, err.message);
+                        cleanupClient(sessionId);
+                    });
+                }
+                // If it's not in initializingSessions, it means cleanupClient was called
+                // and we should just stay closed.
+            }
+        }
     });
 
-    client.on('ready', async () => {
-        console.log(`[READY] Client is ready for session: ${sessionId}`);
+    // ... (Incoming Message Handler - sock.ev.on('messages.upsert', ...)) ...
+    // Your existing code for this is correct.
+    sock.ev.on('messages.upsert', async (m) => {
+        if (m.type !== 'notify') return;
+        const msg = m.messages[0];
+        if (msg.key.fromMe || msg.key.remoteJid === 'status@broadcast') return;
         
-        if (initializingSessions[sessionId]) {
-            clearTimeout(initializingSessions[sessionId].timeoutId);
-        }
+        console.log(`[INCOMING MESSAGE] Triggered for ${sessionId}. From: ${msg.key.remoteJid}`);
+        if (activeClients[sessionId]) activeClients[sessionId].lastUsed = new Date();
 
-        activeClients[sessionId] = { client, lastUsed: new Date() };
-        delete initializingSessions[sessionId];
-        
-        // **NEW: Announce to Redis that this worker now owns this session**
-        try {
-            await redisClient.hSet('active_sessions', sessionId, WORKER_ID);
-            console.log(`[REDIS] Registered session ${sessionId} to worker ${WORKER_ID}`);
-        } catch (e) {
-            console.error(`[REDIS_ERROR] Failed to register session ${sessionId}:`, e.message);
-        }
-        
-        sendWebhook('/connected', { sessionId, phone: client.info.wid.user });
-    });
-    
-    // **Corrected message handler**
-    client.on('message', (msg) => {
-        if (msg.fromMe || msg.from === 'status@broadcast' || !msg.id.remote) {
-            return;
-        }
-        console.log(`[INCOMING MESSAGE] Triggered for ${sessionId}. From: ${msg.from}`);
-        if (activeClients[sessionId]) {
-            activeClients[sessionId].lastUsed = new Date();
-        }
-        sendWebhook('/message', { sessionId, from: msg.from, body: msg.body, isMedia: msg.hasMedia, type: msg.type });
+        let body = ''; let type = 'chat';
+        if (msg.message?.conversation) body = msg.message.conversation;
+        else if (msg.message?.extendedTextMessage) body = msg.message.extendedTextMessage.text;
+        else if (msg.message?.imageMessage) { body = msg.message.imageMessage.caption; type = 'image'; }
+        else if (msg.message?.videoMessage) { body = msg.message.videoMessage.caption; type = 'video'; }
+        else if (msg.message?.audioMessage) type = 'audio';
+        else if (msg.message?.documentMessage) type = 'document';
+
+        sendWebhook('/message', { sessionId, from: msg.key.remoteJid, body: body, isMedia: type !== 'chat', type: type });
     });
 
-    client.on('message_ack', (msg, ack) => {
-        if (!msg.fromMe) return;
-        let status;
-        switch (ack) {
-            case 1: status = 'sent'; break;
-            case 2: status = 'delivered'; break;
-            case 3: status = 'read'; break;
-            case -1: status = 'failed'; break;
-            default: return;
+    // ... (Message Status Update Handler - sock.ev.on('messages.update', ...)) ...
+    // Your existing code for this is correct.
+    sock.ev.on('messages.update', (updates) => {
+        for(const { key, update } of updates) {
+            if (!key.fromMe) continue;
+            let status;
+            switch(update.status) {
+                case 3: status = 'sent'; break;
+                case 4: status = 'delivered'; break;
+                case 5: status = 'read'; break;
+                default: return;
+            }
+            console.log(`[STATUS_UPDATE] Session ${sessionId} - Message ${key.id} changed to: ${status}`);
+            sendWebhook('/message-status-update', { sessionId, messageId: key.id, status, timestamp: dayjs().format('YYYY-MM-DD HH:mm:ss') });
         }
-        console.log(`[STATUS_UPDATE] Session ${sessionId} - Message ${msg.id._serialized} changed to: ${status}`);
-        sendWebhook('/message-status-update', { sessionId, messageId: msg.id._serialized, status, timestamp: dayjs().format('YYYY-MM-DD HH:mm:ss') });
     });
 
-    client.on('disconnected', async (reason) => {
-        console.log(`[DISCONNECTED] Client for ${sessionId} was logged out. Reason: ${reason}`);
-        sendWebhook('/disconnected', { sessionId, reason });
-        
-        // **NEW: Remove session from Redis on disconnect**
-        try {
-            await redisClient.hDel('active_sessions', sessionId);
-            console.log(`[REDIS] Deregistered session ${sessionId}`);
-        } catch (e) {
-            console.error(`[REDIS_ERROR] Failed to deregister session ${sessionId}:`, e.message);
-        }
-
-        await cleanupClient(sessionId); 
-    });
-
-    client.on('auth_failure', (msg) => {
-        console.error(`[AUTH_FAILURE] Session ${sessionId}:`, msg);
-        delete initializingSessions[sessionId];
-    });
+    // ... (Save Credentials Handler - sock.ev.on('creds.update', ...)) ...
+    // Your existing code for this is correct.
+    sock.ev.on('creds.update', saveCreds);
 };
 
-// --- System Control & Message Queue ---
+// ... (startCleanupLoop is correct) ...
 const startCleanupLoop = () => {
     cleanupLoop = setInterval(async () => {
         const now = Date.now();
@@ -241,9 +230,7 @@ const startCleanupLoop = () => {
         for (const sessionId of activeSessionIds) {
             const entry = activeClients[sessionId];
             let isAutoResponder = false;
-
             try {
-                // **Check the setting in Redis**
                 const settingsStr = await redisClient.hGet('device_settings', sessionId);
                 if (settingsStr) {
                     isAutoResponder = JSON.parse(settingsStr).autoResponder === true;
@@ -251,148 +238,56 @@ const startCleanupLoop = () => {
             } catch (e) {
                 console.error(`[REDIS_CLEANUP_ERR] Could not check settings for ${sessionId}`, e.message);
             }
-
-            // **Only clean up if it's NOT an auto-responder device AND it's idle**
             if (!isAutoResponder && (now - entry.lastUsed.getTime() > INACTIVITY_TIMEOUT_MS)) {
-                console.log(`[CLEANUP] Session ${sessionId} is idle and not an auto-responder. Cleaning up.`);
+                console.log(`[CLEANUP] Session ${sessionId} is idle. Cleaning up.`);
                 await cleanupClient(sessionId);
             } else if (isAutoResponder) {
-                // It's an auto-responder device, so we just update its 'lastUsed' timestamp
-                // to prevent it from *ever* being seen as idle, even if it has no activity.
                 entry.lastUsed = new Date();
             }
         }
     }, CLEANUP_INTERVAL_MS);
 };
 
-
-/**
- * Classifies a whatsapp-web.js error into a user-friendly code and message.
- * @param {Error} err The error object.
- * @returns {{code: string, friendly: string, raw: string}}
- */
-const classifyError = (err) => {
-    const rawMessage = err.message || 'Unknown error.';
-    
-    // 404 = Number not on WhatsApp
-    if (rawMessage.includes('status 404')) {
-        return {
-            code: 'not_on_whatsapp',
-            friendly: 'This phone number is not registered on WhatsApp.',
-            raw: rawMessage
-        };
-    }
-    // 400 = Invalid number format (often)
-    if (rawMessage.includes('status 400') || rawMessage.includes('invalid wid')) {
-        return {
-            code: 'invalid_number_format',
-            friendly: 'The phone number format is incorrect. Please check the number.',
-            raw: rawMessage
-        };
-    }
-    // Timeout
-    if (rawMessage.includes('TimeoutError') || rawMessage.includes('Navigation timeout')) {
-        return {
-            code: 'timeout',
-            friendly: 'The connection to WhatsApp timed out. This may be a network issue. The system will retry.',
-            raw: rawMessage
-        };
-    }
-    // EPIPE / Connection lost
-    if (rawMessage.includes('EPIPE') || rawMessage.includes('Connection closed')) {
-        return {
-            code: 'connection_lost',
-            friendly: 'The connection to the device was temporarily lost. Please wait a moment and try again.',
-            raw: rawMessage
-        };
-    }
-    // Media download failed
-    if (rawMessage.includes('failed to download') || rawMessage.includes('Could not find a valid URL')) {
-        return {
-            code: 'media_failed',
-            friendly: 'The system could not download the media file. Please check the file URL.',
-            raw: rawMessage
-        };
-    }
-
-    // Default
-    return {
-        code: 'unknown',
-        friendly: 'An unknown error occurred. See logs for details.',
-        raw: rawMessage
-    };
-};
-
-const listenForMessages = async () => {
-    const subscriber = redisClient.duplicate();
-    await subscriber.connect();
-    const channelName = process.env.LARAVEL_CHANNEL;
-    console.log(`[REDIS] Subscriber connected, listening to "${channelName}"`);
-
-    await subscriber.subscribe(channelName, async (message) => {
-
-        let sessionId, tempMessageId, job;
-
+// **IMPROVED: Baileys Message Helper (Now uses Content-Type)**
+const getBaileysMessage = async (mediaUrl, message) => {
+    if (mediaUrl) {
+        let buffer, mimetype, typeKey;
         try {
-            const job = JSON.parse(message);
-            console.log('[REDIS] Laravel Job Payload', job);
-
-            // Destructure and assign directly to the outer variables
-            ({ sessionId, tempMessageId } = job); 
-            
-            const { to, message: text, mediaUrl } = job; // Other variables can remain scoped
-
-            const clientEntry = activeClients[sessionId];
-
-            if (clientEntry) {
-                console.log(`[QUEUE] Worker ${WORKER_ID} processing job for session ${sessionId}`);
-                const client = clientEntry.client;
-                const chatId = `${to}@c.us`;
-                
-                let result;
-
-                // **THIS IS THE FINAL LOGIC FOR MEDIA + CAPTIONS**
-                if (mediaUrl) {
-                    // await new Promise(resolve => setTimeout(resolve, 2000));
-                    const media = await MessageMedia.fromUrl(mediaUrl, { unsafeMime: true });
-                    result = await client.sendMessage(chatId, media, { caption: text });
-                } else {
-                    result = await client.sendMessage(chatId, text);
-                }
-
-                sendWebhook('/message-sent', {
-                    tempMessageId,
-                    finalMessageId: result.id._serialized,
-                    sessionId
-                });
-                clientEntry.lastUsed = new Date();
-            }
-
-        } catch (err) {
-            console.error(`[QUEUE_ERROR] Failed to process job:`, err);
-            console.error(`[QUEUE_ERROR] Original Job Payload:`, message);
-            // **NEW ROBUST ERROR HANDLING**
-            if (job && job.tempMessageId) {
-                // We have job info, so classify the error
-                const errorDetails = classifyError(err);
-                
-                sendWebhook('/message-failed', {
-                    tempMessageId: job.tempMessageId,
-                    sessionId: job.sessionId,
-                    reason: errorDetails.raw, // The original error message
-                    errorCode: errorDetails.code, // The new clean code
-                    friendlyError: errorDetails.friendly // The new UI-friendly message
-                });
-
-            } else {
-                // The error was likely in JSON.parse(message)
-                console.error(`[QUEUE_FATAL] Could not parse job, no error reported to Laravel:`, message);
-            }
+            const response = await axios.get(mediaUrl, { responseType: 'arraybuffer' });
+            buffer = Buffer.from(response.data, 'binary');
+            mimetype = response.headers['content-type'];
+        } catch (e) {
+            throw new Error(`Failed to download media from ${mediaUrl}: ${e.message}`);
         }
-    });
+        
+        // Determine the message type key for Baileys
+        if (mimetype.startsWith('image/')) typeKey = 'image';
+        else if (mimetype.startsWith('video/')) typeKey = 'video';
+        else if (mimetype.startsWith('audio/')) typeKey = 'audio';
+        else typeKey = 'document'; // Default to document
+
+        // Build the message object
+        if (typeKey === 'document') {
+             // For documents, we must provide a mimetype and ideally a filename
+             const fileName = message.substring(0, 15) || path.basename(new URL(mediaUrl).pathname) || 'file';
+             return { document: buffer, caption: message, mimetype: mimetype, fileName: fileName };
+        }
+        if (typeKey === 'audio') {
+            // Audio messages don't have captions
+            return { audio: buffer, mimetype: mimetype };
+        }
+        // Image or Video
+        return { [typeKey]: buffer, caption: message };
+    }
+    // Just text
+    return { text: message };
 };
+
 
 // --- API Endpoints ---
+
+// ... (app.post('/sessions/start', ...)) ...
+// This logic is now correct, as the timeout will be reset by the new connection handler
 app.post('/sessions/start', async (req, res) => {
     const { sessionId } = req.body;
     if (!sessionId) return res.status(400).json({ error: 'Session ID is required.' });
@@ -404,22 +299,26 @@ app.post('/sessions/start', async (req, res) => {
         return res.status(202).json({ message: 'Session is already initializing.' });
     }
     
-    console.log(`[START] Starting initialization for ${sessionId}`);
-    const client = createSessionClient(sessionId);
-    setupClientEvents(client, sessionId);
+    console.log(`[START] Starting Baileys initialization for ${sessionId}`);
+    
     const timeoutId = setTimeout(() => {
         console.log(`[TIMEOUT] QR scan timeout for session: ${sessionId}`);
         cleanupClient(sessionId);
         sendWebhook('/qr-timeout', { sessionId });
     }, QR_GENERATION_TIMEOUT_MS);
-    initializingSessions[sessionId] = { client, qr: null, timeoutId };
-    client.initialize().catch(err => {
+    
+    initializingSessions[sessionId] = { qr: null, timeoutId };
+    
+    createSessionClient(sessionId).catch(err => {
         console.error(`[INIT_ERROR] Failed to initialize ${sessionId}:`, err.message);
         cleanupClient(sessionId);
     });
+    
     res.status(202).json({ message: 'Session initialization process started.' });
 });
 
+// ... (app.get('/sessions/:sessionId/qr', ...)) ...
+// Your existing code for this is correct.
 app.get('/sessions/:sessionId/qr', (req, res) => {
     const { sessionId } = req.params;
     const session = initializingSessions[sessionId];
@@ -433,46 +332,55 @@ app.get('/sessions/:sessionId/qr', (req, res) => {
     }
 });
 
-/**
- * POST /messages/send
- * **MODIFIED:** Uses the new `getActiveClient` helper.
- */
-app.post('/messages/send', async (req, res) => {
-    const { sessionId, to, message, mediaUrl } = req.body;
-    if (!sessionId || !to || !message) {
-        return res.status(400).json({ error: 'Missing required parameters.' });
+
+// ... (app.post('/messages/send-internal', ...)) ...
+// This endpoint is now using the improved getBaileysMessage helper
+app.post('/messages/send-internal', async (req, res) => {
+    const { sessionId, to, message, mediaUrl, tempMessageId } = req.body;
+
+    const clientEntry = activeClients[sessionId];
+    if (!clientEntry) {
+        return res.status(404).json({ error: 'Session not active on this worker. Please re-queue.' });
     }
 
-    // **MODIFIED:** Use getActiveClient instead of getSession
-    const client = getActiveClient(sessionId);
-    if (!client) {
-        // **IMPORTANT:** We DO NOT create a session here. A message can only be sent from an already-connected device.
-        return res.status(404).json({ error: 'Session is not active. Please ensure the device is connected.' });
-    }
-
+    const { sock } = clientEntry;
     try {
-        const chatId = `${to}@c.us`;
-        let result;
+        const jid = `${to}@s.whatsapp.net`;
+        // Use the improved helper
+        const baileysMessage = await getBaileysMessage(mediaUrl, message); 
 
-        if (mediaUrl) {
-            const media = await MessageMedia.fromUrl(mediaUrl, { unsafeMime: true });
-            result = await client.sendMessage(chatId, media, { caption: message });
-        } else {
-            result = await client.sendMessage(chatId, message);
-        }
+        const result = await sock.sendMessage(jid, baileysMessage);
 
-        res.status(200).json({ success: true, id: result.id._serialized });
+        sendWebhook('/message-sent', {
+            tempMessageId,
+            finalMessageId: result.key.id,
+            sessionId
+        });
+        
+        clientEntry.lastUsed = new Date();
+        res.status(200).json({ success: true, id: result.key.id });
 
     } catch (error) {
-        console.error(`[SEND_ERROR] Session ${sessionId}:`, error.message);
+        console.error(`[SEND-INTERNAL-ERROR] Session ${sessionId}:`, error.message);
         res.status(500).json({ success: false, error: 'Failed to send message.', details: error.message });
     }
 });
 
+// ... (app.get('/sessions', ...)) ...
+// Your existing code for this is correct.
 app.get('/sessions', async (req, res) => {
     try {
-        const allSessions = await getAvailableSessions();
-        // **NEW: Fetch active session data from Redis for a global view**
+        await fs.mkdir(SESSIONS_DIR, { recursive: true });
+        const entries = await fs.readdir(SESSIONS_DIR);
+        const allSessions = entries.filter(entry => {
+             // Simple check to ensure it's a directory
+            try {
+                return fs.statSync(path.join(SESSIONS_DIR, entry)).isDirectory();
+            } catch (e) {
+                return false;
+            }
+        });
+        
         const activeSessionData = await redisClient.hGetAll('active_sessions');
         
         const sessionStatus = allSessions.map(id => ({
@@ -481,96 +389,100 @@ app.get('/sessions', async (req, res) => {
             workerId: activeSessionData[id] || 'N/A'
         }));
         
-        res.status(200).json({ 
-            sessions: sessionStatus
-        });
+        res.status(200).json({ sessions: sessionStatus });
     } catch (error) {
         console.error(`[LIST_ERROR]`, error.message);
         res.status(500).json({ error: 'Failed to retrieve sessions list.' });
     }
 });
 
-/**
- * POST /sessions/logout
- * Logs out a session and completely deletes its data.
- */
+// ... (app.post('/sessions/logout', ...)) ...
+// Your existing code for this is correct.
 app.post('/sessions/logout', async (req, res) => {
     const { sessionId } = req.body;
     const clientEntry = activeClients[sessionId];
 
-    if (!clientEntry) {
-        // If not active, try to clean the persistent data anyway
+    if (clientEntry) {
         try {
-            const sessionPath = path.join(SESSION_DIR, sessionId);
-            await fs.rm(sessionPath, { recursive: true, force: true });
-            console.log(`[LOGOUT] Cleaned up disk data for inactive session ${sessionId}.`);
-            return res.status(200).json({ message: 'Session data cleaned from disk (was inactive).' });
+            await clientEntry.sock.logout();
+            console.log(`[LOGOUT] Session ${sessionId} logged out.`);
         } catch (err) {
-            // Ignore common ENOENT errors if folder doesn't exist
-            if (err.code !== 'ENOENT') {
-                 console.error(`[LOGOUT_ERROR] Error cleaning disk data for ${sessionId}:`, err.message);
-            }
-            return res.status(404).json({ error: 'Session not found or not active.' });
+            console.error(`[LOGOUT_ERROR] Error during client logout for ${sessionId}:`, err.message);
         }
     }
 
+    await cleanupClient(sessionId); 
     try {
-        await clientEntry.client.logout(); 
-        console.log(`[LOGOUT] Session ${sessionId} logged out.`);
+        const sessionDir = path.join(SESSIONS_DIR, sessionId);
+        await fs.rm(sessionDir, { recursive: true, force: true });
+        console.log(`[LOGOUT] Cleaned up disk data for session ${sessionId}.`);
     } catch (err) {
-        console.error(`[LOGOUT_ERROR] Error during client logout for ${sessionId}:`, err.message);
-    } finally {
-        await cleanupClient(sessionId); // Cleans up memory and kills Puppeteer
-        res.status(200).json({ message: 'Session logged out and cleaned up.' });
+        if (err.code !== 'ENOENT') {
+             console.error(`[LOGOUT_ERROR] Error cleaning disk data for ${sessionId}:`, err.message);
+        }
     }
+    
+    res.status(200).json({ message: 'Session logged out and cleaned up.' });
 });
 
-// --- Server Startup ---
+
+// ... (Server Startup and Graceful Shutdown are all correct) ...
 const startServer = async () => {
     await redisClient.connect();
-    console.log('[REDIS] Main client connected.');
+    console.log('[REDIS] Web server connected.');
     
-    await listenForMessages(); // Start the message queue listener
-
     app.listen(PORT, () => {
         console.log(`\n======================================================`);
-        console.log(`WhatsApp Gateway Worker ID: ${WORKER_ID}`);
-        console.log(`Server running on port ${PORT}`);
-        console.log('Mode: SCALABLE (Redis State & Pub/Sub Queue)');
+        console.log(`WhatsApp Web Server (ID: ${WORKER_ID}) [Baileys]`);
+        console.log(`Running on port ${PORT}`);
         console.log(`======================================================\n`);
     });
     startCleanupLoop();
 };
-
 startServer();
 
-// --- Graceful Shutdown ---
 const cleanup = async () => {
-    console.log('\n[SHUTDOWN] Cleaning up...');
+    console.log('\n[SHUTDOWN] Cleaning up sessions...');
     clearInterval(cleanupLoop);
-    const sessionIds = Object.keys(activeClients);
-    for (const sessionId of sessionIds) {
-        await redisClient.hDel('active_sessions', sessionId);
-        console.log(`[SHUTDOWN] Deregistered ${sessionId} from Redis.`);
+    const shutdownPromises = [];
+    for (const sessionId of Object.keys(activeClients)) {
+        shutdownPromises.push(
+            (async () => {
+                await activeClients[sessionId].sock.end(new Error('Server shutdown'));
+                await redisClient.hDel('active_sessions', sessionId);
+                console.log(`[SHUTDOWN] Deregistered ${sessionId}.`);
+            })()
+        );
     }
+    await Promise.allSettled(shutdownPromises);
     await redisClient.quit();
-    console.log('[SHUTDOWN] Redis connection closed.');
+    console.log('[SHUTDOWN] Redis connection closed. Exiting.');
     process.exit(0);
 };
 
-process.on('SIGINT', cleanup);
+process.on('SIGINT', cleanup); 
 process.on('SIGTERM', cleanup);
 
 
+
 // const express = require('express');
-// const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+// const { 
+//     default: makeWASocket, 
+//     useMultiFileAuthState, 
+//     DisconnectReason,
+//     fetchLatestBaileysVersion,
+//     // MessageUpsertType,
+//     jidNormalizedUser,
+// } = require('@whiskeysockets/baileys');
+// const pino = require('pino');
 // const qrcode = require('qrcode');
-// const axios = require('axios');
+// const axios = require('axios'); // Needed for downloading media
 // const fs = require('fs/promises');
 // const path = require('path');
 // const dayjs = require('dayjs');
+// const { v4: uuidv4 } = require('uuid');
+// const { createRedisClient, sendWebhook } = require('./shared');
 
-// // To read the environment variables
 // require('dotenv').config();
 
 // const app = express();
@@ -578,467 +490,441 @@ process.on('SIGTERM', cleanup);
 
 // // --- Configuration ---
 // const PORT = process.env.PORT || 3000;
-// const WEBHOOK_BASE_URL = process.env.WEBHOOK_BASE_URL || 'http://localhost:8000/webhook';
-// const API_KEY = process.env.API_KEY; // **NEW: For securing webhooks**
-// const SESSION_DIR = path.join(__dirname, '.wwebjs_auth');
+// const API_KEY = process.env.API_KEY;
+// // **NEW: Baileys sessions directory**
+// const SESSIONS_DIR = path.join(__dirname, 'baileys_sessions'); 
+// const WORKER_ID = `whatsapp-web-${uuidv4()}`;
 
-// // --- Enterprise Scaling Configuration ---
-// const INACTIVITY_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes of inactivity before client is destroyed
-// const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;    // Check for inactive clients every 5 minutes
-// const QR_GENERATION_TIMEOUT_MS = 5 * 60 * 1000; // **NEW: 60-second timeout for QR scan**
+// // --- Scaling Config ---
+// const INACTIVITY_TIMEOUT_MS = 30 * 60 * 1000;
+// const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
+// const QR_GENERATION_TIMEOUT_MS = 300 * 1000;
+
+// // --- Redis Client ---
+// const redisClient = createRedisClient();
 
 // // --- In-Memory Storage ---
-// // activeClients: Stores only the subset of clients that are currently READY and in use.
-// // Format: { sessionId: { client: Client, lastUsed: Date } }
+// // activeClients: { sessionId: { sock: BaileysSocket, lastUsed: Date } }
 // const activeClients = {};
-// // initializingSessions: Tracks sessions currently starting up with additional metadata.
-// // Format: { sessionId: { client: Client, qr: string, timeoutId: NodeJS.Timeout } }
+// // initializingSessions: { sessionId: { qr: string, timeoutId: NodeJS.Timeout } }
 // const initializingSessions = {};
-// let cleanupLoop; // To hold the interval reference
+// let cleanupLoop;
 
-// // --- Middleware for Security ---
+// // --- Middleware (Unchanged) ---
 // const apiKeyMiddleware = (req, res, next) => {
 //     const providedKey = req.headers['x-api-key'];
-//     if (!API_KEY || providedKey === API_KEY) {
-//         return next();
-//     }
+//     if (!API_KEY || providedKey === API_KEY) return next();
 //     res.status(401).json({ error: 'Unauthorized' });
 // };
+// app.use(apiKeyMiddleware);
 
-// app.use(apiKeyMiddleware); // **NEW: Apply middleware to all routes**
-
-// // --- Helper Functions ---
-
-// /**
-//  * Sends a webhook notification to the Laravel backend with retry logic.
-//  * @param {string} endpoint - The specific webhook endpoint.
-//  * @param {object} data - The payload to send.
-//  * @param {number} retries - Number of retries.
-//  */
-// const sendWebhook = async (endpoint, data, retries = 3) => {
-//     for (let i = 0; i < retries; i++) {
-//         try {
-//             await axios.post(`${WEBHOOK_BASE_URL}${endpoint}`, data, {
-//                 headers: { 'X-API-KEY': API_KEY } // **NEW: Send API key back**
-//             });
-//             return; // Success
-//         } catch (err) {
-//             console.error(`[WEBHOOK_ERROR] Attempt ${i + 1} failed for ${endpoint}:`, err.message);
-//             if (i === retries - 1) {
-//                 console.error(`[WEBHOOK_FATAL] All retries failed for ${endpoint}. Data:`, data);
-//             } else {
-//                 await new Promise(res => setTimeout(res, 1000 * (i + 1))); // Exponential backoff
-//             }
-//         }
-//     }
-// };
+// // --- Baileys Helper Functions ---
 
 // /**
-//  * Destroys and cleans up an inactive client from memory.
-//  * @param {string} sessionId
+//  * Destroys and cleans up a client
 //  */
 // const cleanupClient = async (sessionId) => {
 //     const clientEntry = activeClients[sessionId];
 //     const initEntry = initializingSessions[sessionId];
-
 //     console.log(`[CLEANUP] Cleaning up session: ${sessionId}`);
 
 //     if (clientEntry) {
 //         try {
-//             await clientEntry.client.destroy();
+//             // End the connection
+//             clientEntry.sock.end(new Error('Inactive cleanup')); 
 //         } catch (e) {
-//             console.error(`[CLEANUP_ERROR] Failed to destroy active client ${sessionId}:`, e.message);
+//             console.error(`[CLEANUP_ERROR] Failed to end Baileys socket ${sessionId}:`, e.message);
 //         }
 //     }
-    
 //     if (initEntry) {
-//         clearTimeout(initEntry.timeoutId); // Clear any pending QR timeout
-//         // If there's a client instance being initialized, destroy it too
-//         if (initEntry.client) {
-//             try {
-//                 await initEntry.client.destroy();
-//             } catch (e) {
-//                 console.error(`[CLEANUP_ERROR] Failed to destroy initializing client ${sessionId}:`, e.message);
-//             }
-//         }
+//         clearTimeout(initEntry.timeoutId);
 //     }
 
 //     delete activeClients[sessionId];
 //     delete initializingSessions[sessionId];
-// };
 
-// /**
-//  * Scans the SESSION_DIR to find all saved session IDs (folders).
-//  * This provides a low-memory way to get a list of all potential sessions.
-//  * @returns {Promise<string[]>}
-//  */
-// const getAvailableSessions = async () => {
 //     try {
-//         await fs.mkdir(SESSION_DIR, { recursive: true }); // Ensure directory exists
-//         const entries = await fs.readdir(SESSION_DIR, { withFileTypes: true });
-//         // Filter for directories that represent saved sessions
-//         return entries
-//             .filter(dirent => dirent.isDirectory())
-//             .map(dirent => dirent.name);
-//     } catch (error) {
-//         if (error.code !== 'ENOENT') {
-//             console.error("[SCAN_ERROR] Failed to read session directory:", error);
-//         }
-//         return [];
+//         await redisClient.hDel('active_sessions', sessionId);
+//         console.log(`[REDIS] Confirmed deregistration of session ${sessionId}.`);
+//     } catch (e) {
+//         console.error(`[REDIS_ERROR] Failed to deregister session ${sessionId}:`, e.message);
 //     }
 // };
 
 // /**
-//  * Creates and configures a new client instance.
-//  * @param {string} sessionId
-//  * @returns {Client}
+//  * Creates a new Baileys socket client and sets up its events
 //  */
-// const createClient = (sessionId) => {
-//     console.log(`[SETUP] Creating client for session: ${sessionId}`);
-//     return new Client({
-//         authStrategy: new LocalAuth({ clientId: sessionId }),
-//         puppeteer: {
-//             headless: true,
-//             args: [
-//                 '--no-sandbox',
-//                 '--disable-setuid-sandbox',
-//                 '--disable-dev-shm-usage',
-//                 '--disable-accelerated-2d-canvas',
-//                 '--no-first-run',
-//                 '--no-zygote',
-//                 '--single-process', 
-//                 '--disable-gpu',
-//                 '--disable-extensions' // **NEW**
-//             ],
-//         }
-//     });
-// };
+// const createSessionClient = async (sessionId) => {
+//     console.log(`[SETUP] Creating Baileys client for session: ${sessionId}`);
+    
+//     const sessionDir = path.join(SESSIONS_DIR, sessionId);
+//     await fs.mkdir(sessionDir, { recursive: true });
 
-// /**
-//  * Sets up event handlers for a client instance.
-//  * @param {Client} client
-//  * @param {string} sessionId
-//  */
-// const setupClientEvents = (client, sessionId) => {
-//     client.on('qr', (qr) => {
-//         console.log(`[QR] QR code received for ${sessionId}`);
-//         if (initializingSessions[sessionId]) {
-//             // Store the QR code for polling
-//             initializingSessions[sessionId].qr = qr;
-            
-//             // Send to webhook so Laravel DB can be updated
+//     // Use Baileys file-based auth
+//     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+//     const { version } = await fetchLatestBaileysVersion();
+    
+//     const sock = makeWASocket({
+//         version,
+//         auth: state,
+//         printQRInTerminal: false,
+//         logger: pino({ level: 'silent' }), // Set to 'debug' for verbose logs
+//         browser: ['MyWebApp', 'Chrome', '1.0.0'], // Optional
+//     });
+
+//     // --- Setup Event Handlers ---
+
+//     // 1. Handle Connection Updates (QR, Ready, Disconnect)
+//     sock.ev.on('connection.update', async (update) => {
+//         const { connection, lastDisconnect, qr } = update;
+
+//         if (qr) {
+//             console.log(`[QR] QR code received for ${sessionId}`);
 //             qrcode.toDataURL(qr, (err, url) => {
 //                 if (err) return;
+//                 // Store QR for polling
+//                 if (initializingSessions[sessionId]) {
+//                     initializingSessions[sessionId].qr = qr;
+//                 }
+//                 // Send to Laravel
 //                 sendWebhook('/qr-code-received', { sessionId, qrCodeUrl: url });
 //             });
 //         }
-//     });
 
-//     client.on('ready', () => {
-//         console.log(`[READY] Client is ready for session: ${sessionId}`);
-        
-//         // Clear the QR timeout
-//         if (initializingSessions[sessionId]) {
-//             clearTimeout(initializingSessions[sessionId].timeoutId);
+//         if (connection === 'open') {
+//             console.log(`[READY] Client is ready for session: ${sessionId}`);
+//             if (initializingSessions[sessionId]) {
+//                 clearTimeout(initializingSessions[sessionId].timeoutId);
+//             }
+//             activeClients[sessionId] = { sock, lastUsed: new Date() };
+//             delete initializingSessions[sessionId];
+
+//             try {
+//                 await redisClient.hSet('active_sessions', sessionId, WORKER_ID);
+//                 console.log(`[REDIS] Registered session ${sessionId} to WEB worker ${WORKER_ID}`);
+//             } catch (e) {
+//                 console.error(`[REDIS_ERROR] Failed to register session ${sessionId}:`, e.message);
+//             }
+            
+//             const phone = jidNormalizedUser(sock.user.id).split(':')[0];
+//             sendWebhook('/connected', { sessionId, phone });
 //         }
 
-//         activeClients[sessionId] = { client, lastUsed: new Date() };
-//         delete initializingSessions[sessionId];
-        
-//         sendWebhook('/connected', { sessionId, phone: client.info.wid.user });
+//         if (connection === 'close') {
+//             const statusCode = (lastDisconnect.error)?.output?.statusCode;
+//             console.log(`[DISCONNECTED] Session ${sessionId} closed. Reason: ${DisconnectReason[statusCode] || 'Unknown'}`);
+
+//             // 401 = Logged out from another device
+//             if (statusCode === DisconnectReason.loggedOut) {
+//                 console.log(`[AUTH_FAILURE] Device logged out: ${sessionId}. Cleaning up.`);
+//                 sendWebhook('/disconnected', { sessionId, reason: 'logged_out' });
+//                 await cleanupClient(sessionId);
+//                 // Also delete the session directory
+//                 await fs.rm(sessionDir, { recursive: true, force: true });
+//             } else {
+//                 // Don't auto-reconnect if cleaned up manually
+//                 if (activeClients[sessionId]) {
+//                     console.log(`[RECONNECT] Attempting to reconnect: ${sessionId}`);
+//                     createSessionClient(sessionId); // Re-create the client
+//                 }
+//             }
+//         }
 //     });
 
-//     client.on('message', (msg) => {
-//         // Only process incoming messages
-//         if (msg.fromMe || msg.from === 'status@broadcast' || !msg.id.remote) {
+//     // 2. Handle Incoming Messages
+//     sock.ev.on('messages.upsert', async (m) => {
+//         if (m.type !== 'notify') return;
+        
+//         const msg = m.messages[0];
+//         if (msg.key.fromMe || msg.key.remoteJid === 'status@broadcast') {
 //             return;
 //         }
 
-//         console.log(`[INCOMING MESSAGE] Triggered for ${sessionId}. From: ${msg.from}`);
-        
-//         // **CRUCIAL: Update lastUsed timestamp on inbound activity**
+//         console.log(`[INCOMING MESSAGE] Triggered for ${sessionId}. From: ${msg.key.remoteJid}`);
 //         if (activeClients[sessionId]) {
 //             activeClients[sessionId].lastUsed = new Date();
 //         }
 
+//         // Extract message type and body
+//         let body = '';
+//         let type = 'chat';
+//         if (msg.message.conversation) {
+//             body = msg.message.conversation;
+//         } else if (msg.message.extendedTextMessage) {
+//             body = msg.message.extendedTextMessage.text;
+//         } else if (msg.message.imageMessage) {
+//             body = msg.message.imageMessage.caption;
+//             type = 'image';
+//         } else if (msg.message.videoMessage) {
+//             body = msg.message.videoMessage.caption;
+//             type = 'video';
+//         } else if (msg.message.audioMessage) {
+//             type = 'audio';
+//         } else if (msg.message.documentMessage) {
+//             type = 'document';
+//         }
+
 //         sendWebhook('/message', { 
 //             sessionId, 
-//             from: msg.from, 
-//             body: msg.body,
-//             isMedia: msg.hasMedia,
-//             type: msg.type 
+//             from: msg.key.remoteJid, 
+//             body: body,
+//             isMedia: type !== 'chat',
+//             type: type 
 //         });
 //     });
 
-//     client.on('message_ack', (msg, ack) => {
-//         // Only monitor messages we SENT (which will have a proper message ID)
-//         if (!msg.fromMe) {
-//             return;
+//     // 3. Handle Message Status Updates (Sent, Delivered, Read)
+//     sock.ev.on('messages.update', (updates) => {
+//         for(const { key, update } of updates) {
+//             if (!key.fromMe) continue;
+            
+//             let status;
+//             switch(update.status) {
+//                 case 3: status = 'sent'; break; // WAMessageStatus.SERVER_ACK
+//                 case 4: status = 'delivered'; break; // WAMessageStatus.DELIVERY_ACK
+//                 case 5: status = 'read'; break; // WAMessageStatus.READ
+//                 default: return; // Ignore pending, etc.
+//             }
+            
+//             console.log(`[STATUS_UPDATE] Session ${sessionId} - Message ${key.id} changed to: ${status}`);
+//             sendWebhook('/message-status-update', { 
+//                 sessionId, 
+//                 messageId: key.id, // Baileys uses a different ID format
+//                 status, 
+//                 timestamp: dayjs().format('YYYY-MM-DD HH:mm:ss') 
+//             });
 //         }
-
-//         let status;
-        
-//         switch (ack) {
-//             case 1:
-//                 status = 'sent';
-//                 break;
-//             case 2:
-//                 status = 'delivered';
-//                 break;
-//             case 3:
-//                 status = 'read';
-//                 break;
-//             case -1:
-//                 status = 'failed'; // We'll treat auth_failure as a failure to deliver
-//                 break;
-//             default:
-//                 return; // Ignore other states/ack types
-//         }
-        
-//         console.log(`[STATUS_UPDATE] Session ${sessionId} - Message ${msg.id._serialized} changed status to: ${status}`);
-
-//         // Send the webhook to Laravel
-//         sendWebhook('/message-status-update', { 
-//             sessionId: sessionId,
-//             messageId: msg.id._serialized, // The unique ID saved in your MessageLog
-//             status: status,
-//             timestamp: dayjs(new Date()).format('YYYY-MM-DD HH:mm:ss')
-//         });
 //     });
 
-//     client.on('disconnected', async (reason) => {
-//         console.log(`[DISCONNECTED] Client for ${sessionId} was logged out. Reason: ${reason}`);
-//         sendWebhook('/disconnected', { sessionId, reason });
-//         // Clean up
-//         await cleanupClient(sessionId); 
-//     });
-
-//     client.on('auth_failure', (msg) => {
-//         console.error(`[AUTH_FAILURE] Session ${sessionId}:`, msg);
-//         delete initializingSessions[sessionId];
-//     });
-
-//     // Optionally add 'change_state' listener to track connection issues
-//     // client.on('change_state', (state) => console.log(`[STATE] ${sessionId} changed state to ${state}`));
+//     // 4. Save Credentials
+//     sock.ev.on('creds.update', saveCreds);
 // };
 
-// /**
-//  * --- MODIFIED: LAZY LOADING SESSION GETTER ---
-//  * Gets an existing active session. Does NOT create a new one.
-//  * This is used for sending messages where a session MUST be active.
-//  * @param {string} sessionId
-//  * @returns {Client|null}
-//  */
-// const getActiveClient = (sessionId) => {
-//     const entry = activeClients[sessionId];
-//     if (entry && entry.client.info) {
-//         entry.lastUsed = new Date();
-//         return entry.client;
-//     }
-//     return null;
-// };
-
-// // --- System Control Loop ---
-
-// /**
-//  * The main loop to monitor and destroy inactive clients, freeing up resources.
-//  */
 // const startCleanupLoop = () => {
 //     cleanupLoop = setInterval(async () => {
 //         const now = Date.now();
 //         const activeSessionIds = Object.keys(activeClients);
 //         console.log(`[CLEANUP] Running inactivity check. Active clients: ${activeSessionIds.length}`);
-        
+
 //         for (const sessionId of activeSessionIds) {
 //             const entry = activeClients[sessionId];
-//             if (now - entry.lastUsed.getTime() > INACTIVITY_TIMEOUT_MS) {
+//             let isAutoResponder = false;
+
+//             try {
+//                 // **Check the setting in Redis**
+//                 const settingsStr = await redisClient.hGet('device_settings', sessionId);
+//                 if (settingsStr) {
+//                     isAutoResponder = JSON.parse(settingsStr).autoResponder === true;
+//                 }
+//             } catch (e) {
+//                 console.error(`[REDIS_CLEANUP_ERR] Could not check settings for ${sessionId}`, e.message);
+//             }
+
+//             // **Only clean up if it's NOT an auto-responder device AND it's idle**
+//             if (!isAutoResponder && (now - entry.lastUsed.getTime() > INACTIVITY_TIMEOUT_MS)) {
+//                 console.log(`[CLEANUP] Session ${sessionId} is idle and not an auto-responder. Cleaning up.`);
 //                 await cleanupClient(sessionId);
+//             } else if (isAutoResponder) {
+//                 // It's an auto-responder device, so we just update its 'lastUsed' timestamp
+//                 // to prevent it from *ever* being seen as idle, even if it has no activity.
+//                 entry.lastUsed = new Date();
 //             }
 //         }
 //     }, CLEANUP_INTERVAL_MS);
 // };
 
-// // --- API Endpoints ---
-
 // /**
-//  * POST /sessions/start
-//  * **MODIFIED:** This now starts the initialization process with a timeout.
-//  * It doesn't wait for the QR code. It responds immediately.
+//  * --- **NEW: Baileys Message Helper** ---
+//  * Prepares the message object for Baileys
 //  */
+// const getBaileysMessage = async (mediaUrl, message) => {
+//     if (mediaUrl) {
+//         let buffer, type;
+//         try {
+//             const response = await axios.get(mediaUrl, { responseType: 'arraybuffer' });
+//             buffer = Buffer.from(response.data, 'binary');
+//         } catch (e) {
+//             throw new Error(`Failed to download media from ${mediaUrl}: ${e.message}`);
+//         }
+        
+//         // Infer type from URL (simple version)
+//         if (mediaUrl.match(/\.(jpg|jpeg|png|webp)$/i)) {
+//             type = 'image';
+//         } else if (mediaUrl.match(/\.(mp4|avi|mkv)$/i)) {
+//             type = 'video';
+//         } else if (mediaUrl.match(/\.(mp3|ogg|aac)$/i)) {
+//             type = 'audio';
+//         } else {
+//             type = 'document'; // Default to document
+//         }
+        
+//         return { [type]: buffer, caption: message };
+//     }
+//     // Just text
+//     return { text: message };
+// };
+
+
+// // --- API Endpoints ---
 // app.post('/sessions/start', async (req, res) => {
 //     const { sessionId } = req.body;
-//     if (!sessionId) {
-//         return res.status(400).json({ error: 'Session ID is required.' });
-//     }
-
-//     // If already active, just confirm and update timestamp
+//     if (!sessionId) return res.status(400).json({ error: 'Session ID is required.' });
 //     if (activeClients[sessionId]) {
 //         activeClients[sessionId].lastUsed = new Date();
 //         return res.status(200).json({ message: 'Session already active.' });
 //     }
-
 //     if (initializingSessions[sessionId]) {
 //         return res.status(202).json({ message: 'Session is already initializing.' });
 //     }
     
-//     console.log(`[START] Starting initialization for ${sessionId}`);
-
-//     const client = createClient(sessionId);
-//     setupClientEvents(client, sessionId);
-
-//     // Set a timeout to kill the initialization if QR is not scanned
+//     console.log(`[START] Starting Baileys initialization for ${sessionId}`);
+    
 //     const timeoutId = setTimeout(() => {
 //         console.log(`[TIMEOUT] QR scan timeout for session: ${sessionId}`);
 //         cleanupClient(sessionId);
-//         sendWebhook('/qr-timeout', { sessionId }); // **NEW WEBHOOK**
+//         sendWebhook('/qr-timeout', { sessionId });
 //     }, QR_GENERATION_TIMEOUT_MS);
-
-//     initializingSessions[sessionId] = { client, qr: null, timeoutId };
-
-//     client.initialize().catch(err => {
+    
+//     initializingSessions[sessionId] = { qr: null, timeoutId };
+    
+//     // Start the client, but don't wait for it
+//     createSessionClient(sessionId).catch(err => {
 //         console.error(`[INIT_ERROR] Failed to initialize ${sessionId}:`, err.message);
-//         cleanupClient(sessionId); // Clean up on failure
+//         cleanupClient(sessionId);
 //     });
     
 //     res.status(202).json({ message: 'Session initialization process started.' });
 // });
 
-// /**
-//  * **NEW ENDPOINT**
-//  * GET /sessions/:sessionId/qr
-//  * Allows the frontend to poll for the QR code.
-//  */
 // app.get('/sessions/:sessionId/qr', (req, res) => {
 //     const { sessionId } = req.params;
 //     const session = initializingSessions[sessionId];
-
 //     if (session && session.qr) {
 //         qrcode.toDataURL(session.qr, (err, url) => {
 //             if (err) return res.status(500).json({ error: 'Failed to generate QR code URL.' });
 //             res.status(200).json({ qrCodeUrl: url });
 //         });
 //     } else {
-//         // This could mean it's not ready yet, or it has timed out
 //         res.status(404).json({ error: 'QR code not available or session expired.' });
 //     }
 // });
 
-// /**
-//  * GET /sessions
-//  * Lists all known session IDs by scanning the disk (low memory).
-//  */
+// // **This is the internal endpoint called by worker.js**
+// app.post('/messages/send-internal', async (req, res) => {
+//     const { sessionId, to, message, mediaUrl, tempMessageId } = req.body;
+
+//     const clientEntry = activeClients[sessionId];
+//     if (!clientEntry) {
+//         return res.status(404).json({ error: 'Session not active on this worker. Please re-queue.' });
+//     }
+
+//     const { sock } = clientEntry;
+//     try {
+//         const jid = `${to}@s.whatsapp.net`;
+//         const baileysMessage = await getBaileysMessage(mediaUrl, message);
+
+//         // Send the message
+//         const result = await sock.sendMessage(jid, baileysMessage);
+
+//         // Send success webhook back to Laravel
+//         sendWebhook('/message-sent', {
+//             tempMessageId,
+//             finalMessageId: result.key.id, // Baileys ID
+//             sessionId
+//         });
+        
+//         clientEntry.lastUsed = new Date();
+//         res.status(200).json({ success: true, id: result.key.id });
+
+//     } catch (error) {
+//         console.error(`[SEND-INTERNAL-ERROR] Session ${sessionId}:`, error.message);
+//         res.status(500).json({ success: false, error: 'Failed to send message.', details: error.message });
+//     }
+// });
+
 // app.get('/sessions', async (req, res) => {
 //     try {
-//         const allSessions = await getAvailableSessions();
-//         const activeSessionIds = Object.keys(activeClients);
-
+//         await fs.mkdir(SESSIONS_DIR, { recursive: true });
+//         const entries = await fs.readdir(SESSIONS_DIR);
+//         const allSessions = entries.filter(entry => fs.statSync(path.join(SESSIONS_DIR, entry)).isDirectory());
+        
+//         const activeSessionData = await redisClient.hGetAll('active_sessions');
+        
 //         const sessionStatus = allSessions.map(id => ({
 //             sessionId: id,
-//             status: activeSessionIds.includes(id) ? 'active' : 'saved',
-//             lastUsed: activeClients[id] ? activeClients[id].lastUsed.toISOString() : 'N/A'
+//             status: activeSessionData[id] ? 'active' : 'saved',
+//             workerId: activeSessionData[id] || 'N/A'
 //         }));
         
-//         res.status(200).json({ 
-//             totalSessions: allSessions.length,
-//             activeCount: activeSessionIds.length,
-//             sessions: sessionStatus
-//         });
+//         res.status(200).json({ sessions: sessionStatus });
 //     } catch (error) {
 //         console.error(`[LIST_ERROR]`, error.message);
 //         res.status(500).json({ error: 'Failed to retrieve sessions list.' });
 //     }
 // });
 
-// /**
-//  * POST /messages/send
-//  * **MODIFIED:** Uses the new `getActiveClient` helper.
-//  */
-// app.post('/messages/send', async (req, res) => {
-//     const { sessionId, to, message, mediaUrl } = req.body;
-//     if (!sessionId || !to || !message) {
-//         return res.status(400).json({ error: 'Missing required parameters.' });
-//     }
-
-//     // **MODIFIED:** Use getActiveClient instead of getSession
-//     const client = getActiveClient(sessionId);
-//     if (!client) {
-//         // **IMPORTANT:** We DO NOT create a session here. A message can only be sent from an already-connected device.
-//         return res.status(404).json({ error: 'Session is not active. Please ensure the device is connected.' });
-//     }
-
-//     try {
-//         const chatId = `${to}@c.us`;
-//         let result;
-
-//         if (mediaUrl) {
-//             const media = await MessageMedia.fromUrl(mediaUrl, { unsafeMime: true });
-//             result = await client.sendMessage(chatId, media, { caption: message });
-//         } else {
-//             result = await client.sendMessage(chatId, message);
-//         }
-
-//         res.status(200).json({ success: true, id: result.id._serialized });
-
-//     } catch (error) {
-//         console.error(`[SEND_ERROR] Session ${sessionId}:`, error.message);
-//         res.status(500).json({ success: false, error: 'Failed to send message.', details: error.message });
-//     }
-// });
-
-// /**
-//  * POST /sessions/logout
-//  * Logs out a session and completely deletes its data.
-//  */
 // app.post('/sessions/logout', async (req, res) => {
 //     const { sessionId } = req.body;
 //     const clientEntry = activeClients[sessionId];
 
-//     if (!clientEntry) {
-//         // If not active, try to clean the persistent data anyway
+//     if (clientEntry) {
 //         try {
-//             const sessionPath = path.join(SESSION_DIR, sessionId);
-//             await fs.rm(sessionPath, { recursive: true, force: true });
-//             console.log(`[LOGOUT] Cleaned up disk data for inactive session ${sessionId}.`);
-//             return res.status(200).json({ message: 'Session data cleaned from disk (was inactive).' });
+//             await clientEntry.sock.logout();
+//             console.log(`[LOGOUT] Session ${sessionId} logged out.`);
 //         } catch (err) {
-//             // Ignore common ENOENT errors if folder doesn't exist
-//             if (err.code !== 'ENOENT') {
-//                  console.error(`[LOGOUT_ERROR] Error cleaning disk data for ${sessionId}:`, err.message);
-//             }
-//             return res.status(404).json({ error: 'Session not found or not active.' });
+//             console.error(`[LOGOUT_ERROR] Error during client logout for ${sessionId}:`, err.message);
 //         }
 //     }
 
+//     // Always cleanup files and memory
+//     await cleanupClient(sessionId); 
 //     try {
-//         await clientEntry.client.logout(); 
-//         console.log(`[LOGOUT] Session ${sessionId} logged out.`);
+//         const sessionDir = path.join(SESSIONS_DIR, sessionId);
+//         await fs.rm(sessionDir, { recursive: true, force: true });
+//         console.log(`[LOGOUT] Cleaned up disk data for session ${sessionId}.`);
 //     } catch (err) {
-//         console.error(`[LOGOUT_ERROR] Error during client logout for ${sessionId}:`, err.message);
-//     } finally {
-//         await cleanupClient(sessionId); // Cleans up memory and kills Puppeteer
-//         res.status(200).json({ message: 'Session logged out and cleaned up.' });
+//         if (err.code !== 'ENOENT') {
+//              console.error(`[LOGOUT_ERROR] Error cleaning disk data for ${sessionId}:`, err.message);
+//         }
 //     }
+    
+//     res.status(200).json({ message: 'Session logged out and cleaned up.' });
 // });
 
 // // --- Server Startup ---
-// app.listen(PORT, () => {
-//     console.log(`\n======================================================`);
-//     console.log(`WhatsApp Gateway running on port ${PORT}`);
-//     console.log(`Webhook Base URL: ${WEBHOOK_BASE_URL}`);
-//     console.log('Mode: LAZY-LOADED & ON-DEMAND (Low Memory at Startup)');
-//     console.log(`Inactivity Timeout: ${INACTIVITY_TIMEOUT_MS / 60000} minutes`);
-//     console.log(`QR Timeout: ${QR_GENERATION_TIMEOUT_MS / 1000} seconds`);
-//     console.log(`======================================================\n`);
-//     startCleanupLoop(); // Start the memory management loop
-// });
+// const startServer = async () => {
+//     await redisClient.connect();
+//     console.log('[REDIS] Web server connected.');
+    
+//     app.listen(PORT, () => {
+//         console.log(`\n======================================================`);
+//         console.log(`WhatsApp Web Server (ID: ${WORKER_ID}) [Baileys]`);
+//         console.log(`Running on port ${PORT}`);
+//         console.log(`======================================================\n`);
+//     });
+//     startCleanupLoop();
+// };
+
+// startServer();
 
 // // --- Graceful Shutdown ---
 // const cleanup = async () => {
+//     // ... (Your graceful shutdown code is good, but let's make it Baileys-specific)
 //     console.log('\n[SHUTDOWN] Cleaning up sessions...');
-//     clearInterval(cleanupLoop); // Stop the cleanup loop
-//     const shutdownPromises = Object.values(activeClients).map(entry => entry.client.destroy().catch(e => console.error(`[SHUTDOWN_ERR] Failed to destroy client:`, e.message)));
+//     clearInterval(cleanupLoop);
+//     const shutdownPromises = [];
+//     for (const sessionId of Object.keys(activeClients)) {
+//         shutdownPromises.push(
+//             (async () => {
+//                 await activeClients[sessionId].sock.end(new Error('Server shutdown'));
+//                 await redisClient.hDel('active_sessions', sessionId);
+//                 console.log(`[SHUTDOWN] Deregistered ${sessionId}.`);
+//             })()
+//         );
+//     }
 //     await Promise.allSettled(shutdownPromises);
-//     console.log('[SHUTDOWN] All active sessions destroyed. Exiting.');
+//     await redisClient.quit();
+//     console.log('[SHUTDOWN] Redis connection closed. Exiting.');
 //     process.exit(0);
 // };
 
